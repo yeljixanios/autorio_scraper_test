@@ -9,10 +9,6 @@ import aiohttp
 from aiohttp import ClientTimeout
 from bs4 import BeautifulSoup
 from sqlalchemy.orm import Session
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 from app.config import config
 from app.database import get_db_session, DatabaseManager
@@ -28,7 +24,6 @@ class AutoRiaScraper:
         self.session: Optional[aiohttp.ClientSession] = None
         self.db_manager = DatabaseManager()
         self.semaphore = asyncio.Semaphore(config.CONCURRENT_REQUESTS)
-        self.driver = None
 
     async def __aenter__(self):
         self.session = aiohttp.ClientSession(headers=self.headers, timeout=self.timeout)
@@ -97,92 +92,71 @@ class AutoRiaScraper:
         
         return 0
 
-    def start_driver(self):
-        if self.driver is None:
-            options = webdriver.ChromeOptions()
-            options.add_argument("--headless")
-            options.add_argument("--no-sandbox")
-            options.add_argument("--disable-dev-shm-usage")
-            # Add these options to help with stability
-            options.add_argument("--disable-gpu")
-            options.add_argument("--window-size=1920,1080")
-            
-            try:
-                self.driver = webdriver.Chrome(options=options)
-            except Exception as e:
-                logger.error(f"Failed to start Chrome driver: {e}")
-                # Fallback to not using Selenium for phone numbers
-                self.driver = None
-
-    def stop_driver(self):
-        if self.driver:
-            self.driver.quit()
-            self.driver = None
-
-    def get_phone_number_selenium(self, url: str) -> str:
-        if not self.driver:
-            self.start_driver()
-            if not self.driver:  # Если драйвер все равно не запустился
-                return ""
-        
-        try:
-            self.driver.get(url)
-
-            try:
-
-                show_btn = WebDriverWait(self.driver, 10).until(
-                    EC.element_to_be_clickable((By.CSS_SELECTOR, "a.phone_show_link"))
-                )
-                show_btn.click()
-                
-
-                phone_el = WebDriverWait(self.driver, 10).until(
-                    EC.visibility_of_element_located((By.CSS_SELECTOR, "span.phone.bold"))
-                )
-                
-                # Получаем текст телефона
-                phone = phone_el.text.strip()
-                logger.info(f"Found phone number: {phone}")
-                
-                # Normalize number (keep only digits, add 380 if needed)
-                digits = ''.join(filter(str.isdigit, phone))
-                if digits.startswith("380"):
-                    return digits
-                elif digits.startswith("0") and len(digits) == 10:
-                    return "38" + digits
-                elif digits.startswith("8") and len(digits) == 11:
-                    return "3" + digits
-                elif digits.startswith("9") and len(digits) == 9:
-                    return "380" + digits
-                return digits
-            except Exception as e:
-                logger.warning(f"Could not get phone number via Selenium: {e}")
-                
-
-                try:
-                    phone_elements = self.driver.find_elements(By.CSS_SELECTOR, "span.phone.bold")
-                    if phone_elements:
-                        phone = phone_elements[0].text.strip()
-                        if phone and not "xxx" in phone: 
-                            logger.info(f"Found phone directly: {phone}")
-                            digits = ''.join(filter(str.isdigit, phone))
-                            return digits
-                except Exception as inner_e:
-                    logger.warning(f"Failed to find phone directly: {inner_e}")
-                
-                return ""
-        except Exception as e:
-            logger.error(f"Selenium error: {e}")
-            # Close and restart driver on error
-            self.stop_driver()
-            return ""
-
-    async def get_phone_number_selenium_async(self, url: str) -> str:
-        loop = asyncio.get_event_loop()
-        return await loop.run_in_executor(None, self.get_phone_number_selenium, url)
-
     def get_phone_number(self, url: str, cookies: dict) -> str:
-        return self.get_phone_number_selenium(url)
+        """
+        Get phone number through request to /users/phones/{id}?hash=...&expires=...
+        """
+        try:
+            resp = requests.get(url, headers=self.headers, cookies=cookies, timeout=15)
+            if resp.status_code != 200:
+                logger.warning(f"Failed to get car page for phone: {url}")
+                return ""
+            html = resp.text
+            # Parse car id from url
+            m = re.search(r'_(\d+)\.html', url)
+            if not m:
+                logger.warning(f"Could not extract car id from url: {url}")
+                return ""
+            car_id = m.group(1)
+            # Parse hash and expires from page
+            soup = BeautifulSoup(html, "lxml")
+            script = soup.find("script", attrs={"data-hash": True, "data-expires": True})
+            if not script:
+                logger.warning(f"Could not find phone script for {url}")
+                return ""
+            hash_ = script.get("data-hash")
+            expires = script.get("data-expires")
+            if not hash_ or not expires:
+                logger.warning(f"Could not extract hash/expires for {url}")
+                return ""
+            phone_url = f"https://auto.ria.com/users/phones/{car_id}?hash={hash_}&expires={expires}"
+            phone_resp = requests.get(phone_url, headers=self.headers, cookies=cookies, timeout=15)
+            if phone_resp.status_code != 200:
+                logger.warning(f"Failed to get phone for {url}")
+                return ""
+            try:
+                data = phone_resp.json()
+                phones = data.get("phones", [])
+                numbers = []
+                for phone in phones:
+                    raw = phone.get("phoneFormatted", "")
+                    digits = ''.join(filter(str.isdigit, raw))
+                    if digits.startswith("0") and len(digits) == 10:
+                        digits = "38" + digits
+                    elif digits.startswith("380"):
+                        pass
+                    numbers.append(digits)
+                if numbers:
+                    return ",".join(numbers)
+                # fallback: якщо нічого не знайшли, пробуємо formattedPhoneNumber з кореня
+                raw = data.get("formattedPhoneNumber", "")
+                digits = ''.join(filter(str.isdigit, raw))
+                if digits:
+                    if digits.startswith("0") and len(digits) == 10:
+                        digits = "38" + digits
+                    elif digits.startswith("380"):
+                        pass
+                    elif digits.startswith("9") and len(digits) == 9:
+                        digits = "380" + digits
+                    elif digits.startswith("8") and len(digits) == 11:
+                        digits = "3" + digits
+                    return digits
+            except Exception as e:
+                logger.warning(f"Failed to parse phone json for {url}: {e}")
+            return ""
+        except Exception as e:
+            logger.error(f"Error getting phone for {url}: {e}")
+            return ""
 
     async def parse_car_page(self, soup: BeautifulSoup, url: str, cookies: dict) -> dict:
         try:

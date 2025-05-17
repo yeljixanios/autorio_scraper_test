@@ -11,6 +11,7 @@ from app.config import config
 from app.dumper import dump_database
 from app.logger import logger
 from app.scraper import AutoRiaScraper
+from app.database import init_db
 
 class ScraperScheduler:
     """Scheduler for managing scraping and database dump tasks."""
@@ -70,6 +71,8 @@ async def test_run() -> None:
 
 async def main() -> None:
     """Main entry point for the scheduler."""
+    init_db()
+
     parser = argparse.ArgumentParser(description="AutoRia Scheduler")
     parser.add_argument(
         "--test-now",
